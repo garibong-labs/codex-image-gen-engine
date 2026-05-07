@@ -47,8 +47,12 @@ python3 codex_cli_image_gen.py \
   - `generation.provider`: `openai-codex`
   - `generation.backend`: `codex-cli-built-in-image-generation`
   - `generation.modelLabel`: `gpt-image-2` by default
-- Override labels with `CODEX_IMAGE_PROVIDER_LABEL`, `CODEX_IMAGE_BACKEND_LABEL`, or `CODEX_IMAGE_MODEL_LABEL` when Codex changes its image backend.
-- Codex CLI does not expose a structured provider/model field for built-in image generation today, so these labels are audit markers for the only backend path this wrapper invokes.
+  - `generation.modelLabelSource`: `openai-codex-cli-official-docs` by default
+  - `generation.modelConfidence`: `docs-backed-not-runtime-verified` by default
+  - `generation.modelEvidenceUrl`: `https://developers.openai.com/codex/cli/features#image-generation` by default
+- OpenAI Codex CLI official docs state that built-in image generation uses `gpt-image-2`.
+- Codex CLI does not expose per-run structured provider/model telemetry here, so this is docs-backed rather than runtime-verified.
+- Override labels with `CODEX_IMAGE_PROVIDER_LABEL`, `CODEX_IMAGE_BACKEND_LABEL`, `CODEX_IMAGE_MODEL_LABEL`, or `CODEX_IMAGE_MODEL_EVIDENCE_URL` only when you have a better source for the run.
 - Use `--meta-json <path>` to choose another metadata path, or `--no-meta` to disable sidecar output.
 
 ## Notes
