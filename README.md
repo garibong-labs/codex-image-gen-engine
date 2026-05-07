@@ -10,6 +10,7 @@ Shared Codex-based image generation engine for Garibong Labs pipelines.
 - Optionally converts/re-saves as JPEG with `--jpeg-quality`
 - Optionally flattens alpha onto white for JPEG output with `--flatten-to-jpeg`
 - Can auto-remove flat background edges for transparent asset workflows
+- Writes backend/model metadata sidecars by default (`<filename>.meta.json`)
 
 ## Format policy
 - **기본은 포맷 보존**이다.
@@ -39,6 +40,16 @@ python3 codex_cli_image_gen.py \
   --jpeg-quality 85 \
   --flatten-to-jpeg
 ```
+
+## Metadata
+- By default the engine writes `<filename>.meta.json` next to the requested output.
+- The metadata records the declared generation path used by this engine:
+  - `generation.provider`: `openai-codex`
+  - `generation.backend`: `codex-cli-built-in-image-generation`
+  - `generation.modelLabel`: `gpt-image-2` by default
+- Override labels with `CODEX_IMAGE_PROVIDER_LABEL`, `CODEX_IMAGE_BACKEND_LABEL`, or `CODEX_IMAGE_MODEL_LABEL` when Codex changes its image backend.
+- Codex CLI does not expose a structured provider/model field for built-in image generation today, so these labels are audit markers for the only backend path this wrapper invokes.
+- Use `--meta-json <path>` to choose another metadata path, or `--no-meta` to disable sidecar output.
 
 ## Notes
 - Uses Codex CLI login state from `~/.codex/auth.json`

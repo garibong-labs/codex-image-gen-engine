@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -63,6 +64,47 @@ class ImageProcessingTests(unittest.TestCase):
         self.assertEqual(output.parent.parent.name, "tmp")
         self.assertTrue(output.name.startswith("out-"))
         self.assertEqual(output.suffix, ".png")
+
+
+
+class MetadataTests(unittest.TestCase):
+    def test_default_meta_path_appends_meta_json_to_filename(self):
+        output = Path('/tmp/example/out.jpg')
+
+        self.assertEqual(engine.default_meta_path(output), Path('/tmp/example/out.jpg.meta.json'))
+
+    def test_write_generation_meta_records_backend_and_model_labels(self):
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            output = tmp_path / 'out.jpg'
+            safe = tmp_path / 'safe.jpg'
+            last = tmp_path / 'last.txt'
+            meta = tmp_path / 'out.jpg.meta.json'
+            Image.new('RGB', (12, 8), (1, 2, 3)).save(output)
+            Image.new('RGB', (12, 8), (1, 2, 3)).save(safe)
+            last.write_text('/tmp/final.jpg\n', encoding='utf-8')
+
+            engine.write_generation_meta(
+                meta,
+                status='success',
+                output_path=output,
+                safe_output_path=safe,
+                source_path=safe,
+                last_message_path=last,
+                returncode=0,
+                prompt='prompt text',
+                postprocess={'maxSize': 1280, 'flattenToJpeg': True},
+            )
+
+            data = json.loads(meta.read_text(encoding='utf-8'))
+            self.assertEqual(data['status'], 'success')
+            self.assertEqual(data['generation']['provider'], 'openai-codex')
+            self.assertEqual(data['generation']['backend'], 'codex-cli-built-in-image-generation')
+            self.assertEqual(data['generation']['modelLabel'], 'gpt-image-2')
+            self.assertFalse(data['generation']['fallbackProviderUsed'])
+            self.assertEqual(data['codex']['returncode'], 0)
+            self.assertEqual(data['output']['bytes'], output.stat().st_size)
+            self.assertEqual(data['postprocess']['maxSize'], 1280)
 
 
 if __name__ == "__main__":
