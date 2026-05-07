@@ -23,11 +23,13 @@ WORKSPACE = Path.cwd()
 EXEC_WORKSPACE = WORKSPACE / "tmp"
 CODEX_HOME = Path.home() / ".codex"
 AUTH_JSON = CODEX_HOME / "auth.json"
-SCRIPT_VERSION = "2026-05-07.2"
+SCRIPT_VERSION = "2026-05-07.3"
 IMAGE_PROVIDER_LABEL = os.environ.get("CODEX_IMAGE_PROVIDER_LABEL", "openai-codex")
 IMAGE_BACKEND_LABEL = os.environ.get("CODEX_IMAGE_BACKEND_LABEL", "codex-cli-built-in-image-generation")
 IMAGE_MODEL_LABEL = os.environ.get("CODEX_IMAGE_MODEL_LABEL", "gpt-image-2")
-IMAGE_MODEL_LABEL_SOURCE = "env" if "CODEX_IMAGE_MODEL_LABEL" in os.environ else "engine-default"
+IMAGE_MODEL_LABEL_SOURCE = "env" if "CODEX_IMAGE_MODEL_LABEL" in os.environ else "openai-codex-cli-official-docs"
+IMAGE_MODEL_CONFIDENCE = "operator-declared" if "CODEX_IMAGE_MODEL_LABEL" in os.environ else "docs-backed-not-runtime-verified"
+IMAGE_MODEL_EVIDENCE_URL = os.environ.get("CODEX_IMAGE_MODEL_EVIDENCE_URL", "https://developers.openai.com/codex/cli/features#image-generation")
 
 
 def fail(msg: str, code: int = 1) -> int:
@@ -61,10 +63,12 @@ def generation_backend_meta() -> dict:
         "backend": IMAGE_BACKEND_LABEL,
         "modelLabel": IMAGE_MODEL_LABEL,
         "modelLabelSource": IMAGE_MODEL_LABEL_SOURCE,
+        "modelConfidence": IMAGE_MODEL_CONFIDENCE,
+        "modelEvidenceUrl": IMAGE_MODEL_EVIDENCE_URL,
         "execution": "codex exec",
         "usesOpenClawImageGenerateTool": False,
         "fallbackProviderUsed": False,
-        "note": "Codex CLI does not expose a structured provider/model field for built-in image generation; this is the wrapper-declared backend/model audit label for the only generation path this engine invokes.",
+        "note": "OpenAI Codex CLI official docs state that built-in image generation uses gpt-image-2. Codex CLI does not expose per-run structured provider/model telemetry here, so this is docs-backed rather than runtime-verified.",
     }
 
 
