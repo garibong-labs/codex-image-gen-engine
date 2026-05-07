@@ -8,6 +8,7 @@ logged in (for example, ~/.codex/auth.json with auth_mode=chatgpt).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import shutil
@@ -18,9 +19,10 @@ from pathlib import Path
 
 
 WORKSPACE = Path.cwd()
+EXEC_WORKSPACE = WORKSPACE / "tmp"
 CODEX_HOME = Path.home() / ".codex"
 AUTH_JSON = CODEX_HOME / "auth.json"
-SCRIPT_VERSION = "2026-04-24.2"
+SCRIPT_VERSION = "2026-05-07.1"
 
 
 def fail(msg: str, code: int = 1) -> int:
@@ -55,13 +57,25 @@ def build_prompt(user_prompt: str, output_path: Path) -> str:
     )
 
 
+def make_safe_temp_output(output_path: Path) -> Path:
+    safe_dir = WORKSPACE / "tmp" / "generated-images"
+    safe_dir.mkdir(parents=True, exist_ok=True)
+    suffix = output_path.suffix if output_path.suffix else ".png"
+    stem = output_path.stem or "image"
+    digest = hashlib.sha1(str(output_path).encode("utf-8")).hexdigest()[:12]
+    return (safe_dir / f"{stem}-{digest}{suffix}").resolve()
+
+
 def run_codex(prompt: str, output_last: Path) -> subprocess.CompletedProcess[str]:
+    EXEC_WORKSPACE.mkdir(parents=True, exist_ok=True)
     cmd = [
         "codex",
         "exec",
         "--skip-git-repo-check",
+        "--ephemeral",
+        "--ignore-rules",
         "--sandbox", "workspace-write",
-        "-C", str(WORKSPACE),
+        "-C", str(EXEC_WORKSPACE),
         "-o", str(output_last),
         prompt,
     ]
@@ -90,7 +104,9 @@ def auto_make_background_transparent(image_path: Path, tolerance: int = 20) -> b
     except Exception:
         return False
 
-    image = Image.open(image_path).convert("RGBA")
+    original = Image.open(image_path)
+    original_format = original.format
+    image = original.convert("RGBA")
     width, height = image.size
     if width == 0 or height == 0:
         return False
@@ -139,21 +155,42 @@ def auto_make_background_transparent(image_path: Path, tolerance: int = 20) -> b
             q.append((x, y + 1))
 
     if changed:
-        image.save(image_path)
+        save_kwargs = {}
+        if original_format:
+            save_kwargs['format'] = original_format
+        image.save(image_path, **save_kwargs)
     return changed
 
 
-def resize_and_convert_image(image_path: Path, max_width: int | None = None, max_size: int | None = None, jpeg_quality: int | None = None) -> bool:
+def flatten_image_on_white(image):
+    from PIL import Image
+
+    if image.mode in ("RGBA", "LA") or (image.mode == "P" and "transparency" in image.info):
+        rgba = image.convert("RGBA")
+        background = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+        background.alpha_composite(rgba)
+        return background.convert("RGB")
+    if image.mode not in ("RGB", "L"):
+        return image.convert("RGB")
+    return image
+
+
+def resize_and_convert_image(
+    image_path: Path,
+    max_width: int | None = None,
+    max_size: int | None = None,
+    jpeg_quality: int | None = None,
+    flatten_to_jpeg: bool = False,
+) -> bool:
     try:
         from PIL import Image
     except Exception:
         return False
 
     changed = False
-    image = Image.open(image_path)
-    if image.mode not in ("RGB", "L"):
-        image = image.convert("RGB")
-        changed = True
+    original = Image.open(image_path)
+    original_format = original.format
+    image = original.copy()
 
     target_width = None
     if max_size:
@@ -173,23 +210,24 @@ def resize_and_convert_image(image_path: Path, max_width: int | None = None, max
         changed = True
 
     save_kwargs = {}
-    target_format = image.format or 'JPEG'
-    if jpeg_quality is not None:
-        target_format = 'JPEG'
+    if flatten_to_jpeg or jpeg_quality is not None:
+        flattened = flatten_image_on_white(image)
+        if flattened is not image:
+            image = flattened
+            changed = True
         save_kwargs = {
             'format': 'JPEG',
-            'quality': jpeg_quality,
+            'quality': jpeg_quality if jpeg_quality is not None else 90,
             'optimize': True,
         }
         changed = True
-    elif target_format == 'PNG' and image_path.suffix.lower() in ('.jpg', '.jpeg'):
-        target_format = 'JPEG'
-        save_kwargs = {
-            'format': 'JPEG',
-            'quality': 90,
-            'optimize': True,
-        }
+    elif image.mode not in ("RGB", "RGBA", "L"):
+        image = image.convert("RGB")
         changed = True
+        if original_format:
+            save_kwargs['format'] = original_format
+    elif original_format:
+        save_kwargs['format'] = original_format
 
     if changed:
         image.save(image_path, **save_kwargs)
@@ -207,13 +245,14 @@ def main() -> int:
     parser.add_argument(
         "--postprocess-transparent",
         choices=["off", "auto", "force"],
-        default="auto",
+        default="off",
         help="Postprocess background transparency",
     )
     parser.add_argument("--debug", action="store_true", help="Print Codex stdout/stderr on failure")
     parser.add_argument("--max-width", type=int, default=None, help="Downscale output if wider than this many pixels")
     parser.add_argument("--max-size", type=int, default=None, help="Downscale output if the longer edge exceeds this many pixels")
     parser.add_argument("--jpeg-quality", type=int, default=None, help="Re-save output as JPEG with this quality (1-100)")
+    parser.add_argument("--flatten-to-jpeg", action="store_true", help="Flatten/convert final image to JPEG after generation")
     parser.add_argument("--version", action="store_true", help="Print script version and exit")
     args = parser.parse_args()
 
@@ -230,9 +269,15 @@ def main() -> int:
         output_path = (WORKSPACE / output_path).resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    output_last = WORKSPACE / "tmp" / "codex-cli-image-last-message.txt"
+    output_digest = hashlib.sha1(str(output_path).encode("utf-8")).hexdigest()[:12]
+    output_last = EXEC_WORKSPACE / f"codex-cli-image-last-message-{output_digest}.txt"
     output_last.parent.mkdir(parents=True, exist_ok=True)
-    prompt = build_prompt(args.prompt, output_path)
+    if output_last.exists():
+        output_last.unlink()
+    safe_output_path = make_safe_temp_output(output_path)
+    if safe_output_path.exists():
+        safe_output_path.unlink()
+    prompt = build_prompt(args.prompt, safe_output_path)
     proc = run_codex(prompt, output_last)
 
     if args.debug and (proc.stdout or proc.stderr):
@@ -241,23 +286,41 @@ def main() -> int:
         print("--- codex stderr ---", file=sys.stderr)
         print(proc.stderr, file=sys.stderr)
 
-    if output_path.exists() and output_path.stat().st_size > 0:
+    if safe_output_path.exists() and safe_output_path.stat().st_size > 0:
         if args.postprocess_transparent != "off":
-            auto_make_background_transparent(output_path, tolerance=20 if args.postprocess_transparent == "auto" else 40)
-        resize_and_convert_image(output_path, max_width=args.max_width, max_size=args.max_size, jpeg_quality=args.jpeg_quality)
+            auto_make_background_transparent(safe_output_path, tolerance=20 if args.postprocess_transparent == "auto" else 40)
+        resize_and_convert_image(
+            safe_output_path,
+            max_width=args.max_width,
+            max_size=args.max_size,
+            jpeg_quality=args.jpeg_quality,
+            flatten_to_jpeg=args.flatten_to_jpeg,
+        )
+        shutil.copy2(safe_output_path, output_path)
         print(str(output_path))
         return 0
 
     last_text = output_last.read_text(encoding="utf-8").strip() if output_last.exists() else ""
     search_text = "\n".join(part for part in [last_text, proc.stdout or "", proc.stderr or ""] if part)
     reported = extract_path(search_text)
-    if reported and reported.exists() and reported != output_path:
-        shutil.copy2(reported, output_path)
-        if args.postprocess_transparent != "off":
-            auto_make_background_transparent(output_path, tolerance=20 if args.postprocess_transparent == "auto" else 40)
-        resize_and_convert_image(output_path, max_width=args.max_width, max_size=args.max_size, jpeg_quality=args.jpeg_quality)
-        print(str(output_path))
-        return 0
+    if reported and reported.exists():
+        source_path = reported
+        if source_path != safe_output_path and not safe_output_path.exists():
+            shutil.copy2(source_path, safe_output_path)
+            source_path = safe_output_path
+        if source_path.exists():
+            if args.postprocess_transparent != "off":
+                auto_make_background_transparent(source_path, tolerance=20 if args.postprocess_transparent == "auto" else 40)
+            resize_and_convert_image(
+                source_path,
+                max_width=args.max_width,
+                max_size=args.max_size,
+                jpeg_quality=args.jpeg_quality,
+                flatten_to_jpeg=args.flatten_to_jpeg,
+            )
+            shutil.copy2(source_path, output_path)
+            print(str(output_path))
+            return 0
 
     msg = "Codex did not produce the requested output file"
     if proc.returncode != 0:

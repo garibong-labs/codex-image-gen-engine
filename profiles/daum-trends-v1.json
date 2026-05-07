@@ -1,8 +1,10 @@
 {
   "profile": "daum-trends-v1",
-  "scriptVersion": "2026-04-24.2",
+  "scriptVersion": "2026-05-07.1",
   "maxSize": 1280,
   "jpegQuality": 85,
+  "flattenToJpeg": true,
+  "postprocessTransparent": "off",
   "style": "cohesive editorial illustration, painterly but clean, natural color palette, soft brush texture, modern magazine feature art, consistent visual style across the set, no text, no watermark, high detail",
   "composition": "Use a visually clear single-scene composition that matches the keyword precisely."
 }
