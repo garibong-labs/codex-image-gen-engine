@@ -1,6 +1,6 @@
 {
   "profile": "daum-trends-v1",
-  "scriptVersion": "2026-05-07.1",
+  "scriptVersion": "2026-05-07.2",
   "maxSize": 1280,
   "jpegQuality": 85,
   "flattenToJpeg": true,

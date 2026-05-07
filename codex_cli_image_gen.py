@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -22,7 +23,11 @@ WORKSPACE = Path.cwd()
 EXEC_WORKSPACE = WORKSPACE / "tmp"
 CODEX_HOME = Path.home() / ".codex"
 AUTH_JSON = CODEX_HOME / "auth.json"
-SCRIPT_VERSION = "2026-05-07.1"
+SCRIPT_VERSION = "2026-05-07.2"
+IMAGE_PROVIDER_LABEL = os.environ.get("CODEX_IMAGE_PROVIDER_LABEL", "openai-codex")
+IMAGE_BACKEND_LABEL = os.environ.get("CODEX_IMAGE_BACKEND_LABEL", "codex-cli-built-in-image-generation")
+IMAGE_MODEL_LABEL = os.environ.get("CODEX_IMAGE_MODEL_LABEL", "gpt-image-2")
+IMAGE_MODEL_LABEL_SOURCE = "env" if "CODEX_IMAGE_MODEL_LABEL" in os.environ else "engine-default"
 
 
 def fail(msg: str, code: int = 1) -> int:
@@ -44,6 +49,75 @@ def ensure_auth() -> tuple[bool, str]:
         return False, "missing chatgpt access_token in auth.json"
     return True, "ok"
 
+
+
+def default_meta_path(output_path: Path) -> Path:
+    return output_path.with_name(f"{output_path.name}.meta.json")
+
+
+def generation_backend_meta() -> dict:
+    return {
+        "provider": IMAGE_PROVIDER_LABEL,
+        "backend": IMAGE_BACKEND_LABEL,
+        "modelLabel": IMAGE_MODEL_LABEL,
+        "modelLabelSource": IMAGE_MODEL_LABEL_SOURCE,
+        "execution": "codex exec",
+        "usesOpenClawImageGenerateTool": False,
+        "fallbackProviderUsed": False,
+        "note": "Codex CLI does not expose a structured provider/model field for built-in image generation; this is the wrapper-declared backend/model audit label for the only generation path this engine invokes.",
+    }
+
+
+def write_generation_meta(
+    meta_path: Path | None,
+    *,
+    status: str,
+    output_path: Path,
+    safe_output_path: Path | None,
+    source_path: Path | None,
+    last_message_path: Path | None,
+    returncode: int | None,
+    prompt: str,
+    postprocess: dict,
+    error: str | None = None,
+) -> None:
+    if meta_path is None:
+        return
+    output_exists = output_path.exists()
+    safe_exists = bool(safe_output_path and safe_output_path.exists())
+    payload = {
+        "status": status,
+        "engine": {
+            "script": "codex_cli_image_gen.py",
+            "scriptVersion": SCRIPT_VERSION,
+        },
+        "generation": generation_backend_meta(),
+        "auth": {
+            "mode": "chatgpt",
+            "source": str(AUTH_JSON),
+        },
+        "output": {
+            "path": str(output_path),
+            "exists": output_exists,
+            "bytes": output_path.stat().st_size if output_exists else 0,
+            "safeOutputPath": str(safe_output_path) if safe_output_path else None,
+            "safeOutputExists": safe_exists,
+            "sourcePath": str(source_path) if source_path else None,
+            "lastMessagePath": str(last_message_path) if last_message_path else None,
+        },
+        "codex": {
+            "returncode": returncode,
+            "command": "codex exec --skip-git-repo-check --ephemeral --ignore-rules --sandbox workspace-write",
+        },
+        "prompt": {
+            "sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        },
+        "postprocess": postprocess,
+    }
+    if error:
+        payload["error"] = error
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    meta_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 def build_prompt(user_prompt: str, output_path: Path) -> str:
     return (
@@ -242,6 +316,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Generate image via Codex CLI auth-only login")
     parser.add_argument("--prompt", "-p", required=True, help="Image prompt")
     parser.add_argument("--filename", "-f", required=True, help="Output filename/path")
+    parser.add_argument("--meta-json", type=Path, default=None, help="Generation metadata JSON path; default is <filename>.meta.json")
+    parser.add_argument("--no-meta", action="store_true", help="Do not write generation metadata JSON")
     parser.add_argument(
         "--postprocess-transparent",
         choices=["off", "auto", "force"],
@@ -268,6 +344,14 @@ def main() -> int:
     if not output_path.is_absolute():
         output_path = (WORKSPACE / output_path).resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    meta_path = None if args.no_meta else (args.meta_json.resolve() if args.meta_json else default_meta_path(output_path))
+    postprocess_meta = {
+        "transparent": args.postprocess_transparent,
+        "maxWidth": args.max_width,
+        "maxSize": args.max_size,
+        "jpegQuality": args.jpeg_quality,
+        "flattenToJpeg": args.flatten_to_jpeg,
+    }
 
     output_digest = hashlib.sha1(str(output_path).encode("utf-8")).hexdigest()[:12]
     output_last = EXEC_WORKSPACE / f"codex-cli-image-last-message-{output_digest}.txt"
@@ -297,6 +381,17 @@ def main() -> int:
             flatten_to_jpeg=args.flatten_to_jpeg,
         )
         shutil.copy2(safe_output_path, output_path)
+        write_generation_meta(
+            meta_path,
+            status="success",
+            output_path=output_path,
+            safe_output_path=safe_output_path,
+            source_path=safe_output_path,
+            last_message_path=output_last,
+            returncode=proc.returncode,
+            prompt=prompt,
+            postprocess=postprocess_meta,
+        )
         print(str(output_path))
         return 0
 
@@ -319,6 +414,17 @@ def main() -> int:
                 flatten_to_jpeg=args.flatten_to_jpeg,
             )
             shutil.copy2(source_path, output_path)
+            write_generation_meta(
+                meta_path,
+                status="success",
+                output_path=output_path,
+                safe_output_path=safe_output_path,
+                source_path=source_path,
+                last_message_path=output_last,
+                returncode=proc.returncode,
+                prompt=prompt,
+                postprocess=postprocess_meta,
+            )
             print(str(output_path))
             return 0
 
@@ -327,6 +433,18 @@ def main() -> int:
         msg += f" (exit={proc.returncode})"
     if last_text:
         msg += f"\nlast_message={last_text}"
+    write_generation_meta(
+        meta_path,
+        status="failure",
+        output_path=output_path,
+        safe_output_path=safe_output_path,
+        source_path=reported,
+        last_message_path=output_last,
+        returncode=proc.returncode,
+        prompt=prompt,
+        postprocess=postprocess_meta,
+        error=msg,
+    )
     return fail(msg)
 
 
