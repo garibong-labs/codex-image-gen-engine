@@ -23,7 +23,9 @@ WORKSPACE = Path.cwd()
 EXEC_WORKSPACE = WORKSPACE / "tmp"
 CODEX_HOME = Path.home() / ".codex"
 AUTH_JSON = CODEX_HOME / "auth.json"
-SCRIPT_VERSION = "2026-05-07.3"
+CODEX_GENERATED_IMAGES = CODEX_HOME / "generated_images"
+SCRIPT_VERSION = "2026-05-13.1"
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 IMAGE_PROVIDER_LABEL = os.environ.get("CODEX_IMAGE_PROVIDER_LABEL", "openai-codex")
 IMAGE_BACKEND_LABEL = os.environ.get("CODEX_IMAGE_BACKEND_LABEL", "codex-cli-built-in-image-generation")
 IMAGE_MODEL_LABEL = os.environ.get("CODEX_IMAGE_MODEL_LABEL", "gpt-image-2")
@@ -84,6 +86,10 @@ def write_generation_meta(
     prompt: str,
     postprocess: dict,
     error: str | None = None,
+    prefer_raw_generated: bool = False,
+    raw_generated_source_path: Path | None = None,
+    ignored_local_output_path: Path | None = None,
+    codex_local_edit_ignored: bool = False,
 ) -> None:
     if meta_path is None:
         return
@@ -107,6 +113,8 @@ def write_generation_meta(
             "safeOutputPath": str(safe_output_path) if safe_output_path else None,
             "safeOutputExists": safe_exists,
             "sourcePath": str(source_path) if source_path else None,
+            "rawGeneratedSourcePath": str(raw_generated_source_path) if raw_generated_source_path else None,
+            "ignoredLocalOutputPath": str(ignored_local_output_path) if ignored_local_output_path else None,
             "lastMessagePath": str(last_message_path) if last_message_path else None,
         },
         "codex": {
@@ -117,17 +125,32 @@ def write_generation_meta(
             "sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
         },
         "postprocess": postprocess,
+        "safety": {
+            "rawCodexGeneratedImagePreferred": prefer_raw_generated,
+            "rawCodexGeneratedImageUsed": bool(raw_generated_source_path),
+            "codexLocalEditIgnored": codex_local_edit_ignored,
+        },
     }
     if error:
         payload["error"] = error
     meta_path.parent.mkdir(parents=True, exist_ok=True)
     meta_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
-def build_prompt(user_prompt: str, output_path: Path) -> str:
+def build_prompt(user_prompt: str, output_path: Path, prefer_raw_generated: bool = False) -> str:
+    raw_guardrail = ""
+    if prefer_raw_generated:
+        raw_guardrail = (
+            "Use the generated bitmap as-is. Do not alter it with Python, PIL, ImageMagick, canvas, SVG, "
+            "or any local drawing/post-processing step. Do not draw replacement text boxes, captions, "
+            "speech bubbles, or overlays. If any generated text is imperfect, leave it imperfect and copy "
+            "the raw generated image. "
+        )
+
     return (
         "Use Codex built-in image generation with the current logged-in account. "
         "Generate exactly one image from this prompt: "
         f"{user_prompt}. "
+        f"{raw_guardrail}"
         "After generation, copy or save the final image into this exact absolute path: "
         f"{output_path}. "
         "If the generated image is initially stored elsewhere, copy it to that exact path. "
@@ -158,6 +181,66 @@ def run_codex(prompt: str, output_last: Path) -> subprocess.CompletedProcess[str
         prompt,
     ]
     return subprocess.run(cmd, text=True, capture_output=True)
+
+
+def list_codex_generated_images() -> set[Path]:
+    if not CODEX_GENERATED_IMAGES.exists():
+        return set()
+    paths: set[Path] = set()
+    try:
+        for path in CODEX_GENERATED_IMAGES.rglob("*"):
+            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS:
+                paths.add(path.resolve())
+    except OSError:
+        return paths
+    return paths
+
+
+def is_codex_generated_image(path: Path) -> bool:
+    try:
+        resolved = path.resolve()
+        generated_root = CODEX_GENERATED_IMAGES.resolve()
+        return resolved.is_file() and resolved.suffix.lower() in IMAGE_EXTENSIONS and generated_root in resolved.parents
+    except OSError:
+        return False
+
+
+def extract_generated_image_paths(text: str) -> list[Path]:
+    candidates = re.findall(r"(/[^\s`'\"<>]+\.(?:png|jpg|jpeg|webp))", text, flags=re.IGNORECASE)
+    paths: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        path = Path(candidate.rstrip(".,);]"))
+        if is_codex_generated_image(path):
+            resolved = path.resolve()
+            if resolved not in seen:
+                paths.append(resolved)
+                seen.add(resolved)
+    return paths
+
+
+def newest_file(paths: list[Path] | set[Path]) -> Path | None:
+    existing = [path for path in paths if path.exists()]
+    if not existing:
+        return None
+    return max(existing, key=lambda path: path.stat().st_mtime_ns)
+
+
+def select_raw_generated_image(search_text: str, before_paths: set[Path]) -> Path | None:
+    """Return the raw Codex image asset, ignoring any later local edits.
+
+    Codex CLI can autonomously run Python/PIL or other local tools after image
+    generation. For this wrapper the authoritative image is the bitmap produced
+    by Codex's built-in image generator under ~/.codex/generated_images, not a
+    workspace file the agent may have redrawn before returning.
+    """
+    mentioned = extract_generated_image_paths(search_text)
+    if mentioned:
+        return newest_file(mentioned)
+
+    after_paths = list_codex_generated_images()
+    new_paths = after_paths - before_paths
+    return newest_file(new_paths)
 
 
 def extract_path(text: str) -> Path | None:
@@ -333,6 +416,14 @@ def main() -> int:
     parser.add_argument("--max-size", type=int, default=None, help="Downscale output if the longer edge exceeds this many pixels")
     parser.add_argument("--jpeg-quality", type=int, default=None, help="Re-save output as JPEG with this quality (1-100)")
     parser.add_argument("--flatten-to-jpeg", action="store_true", help="Flatten/convert final image to JPEG after generation")
+    parser.add_argument(
+        "--prefer-raw-generated",
+        action="store_true",
+        help=(
+            "Prefer the raw Codex built-in image output under ~/.codex/generated_images "
+            "over any workspace file Codex may create after local edits. Default is off."
+        ),
+    )
     parser.add_argument("--version", action="store_true", help="Print script version and exit")
     args = parser.parse_args()
 
@@ -355,6 +446,7 @@ def main() -> int:
         "maxSize": args.max_size,
         "jpegQuality": args.jpeg_quality,
         "flattenToJpeg": args.flatten_to_jpeg,
+        "preferRawGenerated": args.prefer_raw_generated,
     }
 
     output_digest = hashlib.sha1(str(output_path).encode("utf-8")).hexdigest()[:12]
@@ -365,7 +457,8 @@ def main() -> int:
     safe_output_path = make_safe_temp_output(output_path)
     if safe_output_path.exists():
         safe_output_path.unlink()
-    prompt = build_prompt(args.prompt, safe_output_path)
+    prompt = build_prompt(args.prompt, safe_output_path, prefer_raw_generated=args.prefer_raw_generated)
+    generated_before = list_codex_generated_images() if args.prefer_raw_generated else set()
     proc = run_codex(prompt, output_last)
 
     if args.debug and (proc.stdout or proc.stderr):
@@ -373,6 +466,42 @@ def main() -> int:
         print(proc.stdout, file=sys.stderr)
         print("--- codex stderr ---", file=sys.stderr)
         print(proc.stderr, file=sys.stderr)
+
+    last_text = output_last.read_text(encoding="utf-8").strip() if output_last.exists() else ""
+    search_text = "\n".join(part for part in [last_text, proc.stdout or "", proc.stderr or ""] if part)
+    raw_generated = select_raw_generated_image(search_text, generated_before) if args.prefer_raw_generated else None
+
+    if raw_generated and raw_generated.exists() and raw_generated.stat().st_size > 0:
+        safe_output_preexisted = safe_output_path.exists()
+        if raw_generated != safe_output_path:
+            shutil.copy2(raw_generated, safe_output_path)
+        if args.postprocess_transparent != "off":
+            auto_make_background_transparent(safe_output_path, tolerance=20 if args.postprocess_transparent == "auto" else 40)
+        resize_and_convert_image(
+            safe_output_path,
+            max_width=args.max_width,
+            max_size=args.max_size,
+            jpeg_quality=args.jpeg_quality,
+            flatten_to_jpeg=args.flatten_to_jpeg,
+        )
+        shutil.copy2(safe_output_path, output_path)
+        write_generation_meta(
+            meta_path,
+            status="success",
+            output_path=output_path,
+            safe_output_path=safe_output_path,
+            source_path=safe_output_path,
+            last_message_path=output_last,
+            returncode=proc.returncode,
+            prompt=prompt,
+            postprocess=postprocess_meta,
+            prefer_raw_generated=args.prefer_raw_generated,
+            raw_generated_source_path=raw_generated,
+            ignored_local_output_path=safe_output_path if safe_output_preexisted and raw_generated != safe_output_path else None,
+            codex_local_edit_ignored=safe_output_preexisted and raw_generated != safe_output_path,
+        )
+        print(str(output_path))
+        return 0
 
     if safe_output_path.exists() and safe_output_path.stat().st_size > 0:
         if args.postprocess_transparent != "off":
@@ -395,12 +524,11 @@ def main() -> int:
             returncode=proc.returncode,
             prompt=prompt,
             postprocess=postprocess_meta,
+            prefer_raw_generated=args.prefer_raw_generated,
         )
         print(str(output_path))
         return 0
 
-    last_text = output_last.read_text(encoding="utf-8").strip() if output_last.exists() else ""
-    search_text = "\n".join(part for part in [last_text, proc.stdout or "", proc.stderr or ""] if part)
     reported = extract_path(search_text)
     if reported and reported.exists():
         source_path = reported
@@ -428,6 +556,7 @@ def main() -> int:
                 returncode=proc.returncode,
                 prompt=prompt,
                 postprocess=postprocess_meta,
+                prefer_raw_generated=args.prefer_raw_generated,
             )
             print(str(output_path))
             return 0
@@ -447,6 +576,7 @@ def main() -> int:
         returncode=proc.returncode,
         prompt=prompt,
         postprocess=postprocess_meta,
+        prefer_raw_generated=args.prefer_raw_generated,
         error=msg,
     )
     return fail(msg)
