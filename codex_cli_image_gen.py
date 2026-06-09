@@ -15,6 +15,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 from collections import deque
 from pathlib import Path
 
@@ -167,7 +168,26 @@ def make_safe_temp_output(output_path: Path) -> Path:
     return (safe_dir / f"{stem}-{digest}{suffix}").resolve()
 
 
-def run_codex(prompt: str, output_last: Path) -> subprocess.CompletedProcess[str]:
+def _append_log(log_path: Path | None, line: str) -> None:
+    if not log_path:
+        return
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as log_file:
+        log_file.write(line)
+
+
+def _stream_pipe(pipe, label: str, chunks: list[str], log_path: Path | None) -> None:
+    try:
+        for line in iter(pipe.readline, ""):
+            chunks.append(line)
+            rendered = f"[codex {label}] {line}"
+            print(rendered, end="", file=sys.stderr, flush=True)
+            _append_log(log_path, rendered)
+    finally:
+        pipe.close()
+
+
+def run_codex(prompt: str, output_last: Path, *, stream: bool = False, log_path: Path | None = None) -> subprocess.CompletedProcess[str]:
     EXEC_WORKSPACE.mkdir(parents=True, exist_ok=True)
     cmd = [
         "codex",
@@ -180,7 +200,28 @@ def run_codex(prompt: str, output_last: Path) -> subprocess.CompletedProcess[str
         "-o", str(output_last),
         prompt,
     ]
-    return subprocess.run(cmd, text=True, capture_output=True)
+    if not stream:
+        return subprocess.run(cmd, text=True, capture_output=True)
+
+    proc = subprocess.Popen(
+        cmd,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=1,
+    )
+    stdout_chunks: list[str] = []
+    stderr_chunks: list[str] = []
+    threads = [
+        threading.Thread(target=_stream_pipe, args=(proc.stdout, "stdout", stdout_chunks, log_path), daemon=True),
+        threading.Thread(target=_stream_pipe, args=(proc.stderr, "stderr", stderr_chunks, log_path), daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+    returncode = proc.wait()
+    for thread in threads:
+        thread.join()
+    return subprocess.CompletedProcess(cmd, returncode, "".join(stdout_chunks), "".join(stderr_chunks))
 
 
 def list_codex_generated_images() -> set[Path]:
@@ -412,6 +453,17 @@ def main() -> int:
         help="Postprocess background transparency",
     )
     parser.add_argument("--debug", action="store_true", help="Print Codex stdout/stderr on failure")
+    parser.add_argument(
+        "--stream-codex-output",
+        action="store_true",
+        help="Stream child Codex stdout/stderr to this wrapper's stderr while still keeping final stdout path-only",
+    )
+    parser.add_argument(
+        "--codex-log",
+        type=Path,
+        default=None,
+        help="Optional log file that receives streamed child Codex stdout/stderr",
+    )
     parser.add_argument("--max-width", type=int, default=None, help="Downscale output if wider than this many pixels")
     parser.add_argument("--max-size", type=int, default=None, help="Downscale output if the longer edge exceeds this many pixels")
     parser.add_argument("--jpeg-quality", type=int, default=None, help="Re-save output as JPEG with this quality (1-100)")
@@ -459,7 +511,7 @@ def main() -> int:
         safe_output_path.unlink()
     prompt = build_prompt(args.prompt, safe_output_path, prefer_raw_generated=args.prefer_raw_generated)
     generated_before = list_codex_generated_images() if args.prefer_raw_generated else set()
-    proc = run_codex(prompt, output_last)
+    proc = run_codex(prompt, output_last, stream=args.stream_codex_output, log_path=args.codex_log)
 
     if args.debug and (proc.stdout or proc.stderr):
         print("--- codex stdout ---", file=sys.stderr)

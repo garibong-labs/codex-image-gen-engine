@@ -1,6 +1,9 @@
 import importlib.util
+import io
 import json
+import os
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -71,6 +74,58 @@ class ImageProcessingTests(unittest.TestCase):
 
         self.assertNotIn("Do not alter it with Python", default_prompt)
         self.assertIn("Do not alter it with Python", raw_prompt)
+
+    def test_run_codex_default_keeps_capture_output(self):
+        calls = []
+        original_run = engine.subprocess.run
+
+        def fake_run(cmd, **kwargs):
+            calls.append((cmd, kwargs))
+            return engine.subprocess.CompletedProcess(cmd, 0, "out", "err")
+
+        engine.subprocess.run = fake_run
+        try:
+            proc = engine.run_codex("prompt", Path("/tmp/last.txt"))
+        finally:
+            engine.subprocess.run = original_run
+
+        self.assertEqual(proc.stdout, "out")
+        self.assertEqual(proc.stderr, "err")
+        self.assertTrue(calls)
+        self.assertTrue(calls[0][1]["capture_output"])
+
+    def test_run_codex_streams_and_accumulates_child_output(self):
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            fake_bin = tmp_path / "bin"
+            fake_bin.mkdir()
+            fake_codex = fake_bin / "codex"
+            fake_codex.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                "print('hello stdout')\n"
+                "print('hello stderr', file=sys.stderr)\n",
+                encoding="utf-8",
+            )
+            fake_codex.chmod(0o755)
+            log_path = tmp_path / "codex.log"
+            original_path = os.environ.get("PATH", "")
+            original_workspace = engine.EXEC_WORKSPACE
+            os.environ["PATH"] = f"{fake_bin}{os.pathsep}{original_path}"
+            engine.EXEC_WORKSPACE = tmp_path / "exec"
+            try:
+                with redirect_stderr(io.StringIO()):
+                    proc = engine.run_codex("prompt", tmp_path / "last.txt", stream=True, log_path=log_path)
+                log = log_path.read_text(encoding="utf-8")
+            finally:
+                os.environ["PATH"] = original_path
+                engine.EXEC_WORKSPACE = original_workspace
+
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("hello stdout", proc.stdout)
+        self.assertIn("hello stderr", proc.stderr)
+        self.assertIn("[codex stdout] hello stdout", log)
+        self.assertIn("[codex stderr] hello stderr", log)
 
     def test_extract_generated_image_paths_only_accepts_codex_generated_images(self):
         with TemporaryDirectory() as tmp:
