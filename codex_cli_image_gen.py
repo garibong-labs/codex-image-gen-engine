@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import os
 import re
@@ -16,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import tempfile
 from collections import deque
 from pathlib import Path
 
@@ -25,7 +27,7 @@ EXEC_WORKSPACE = WORKSPACE / "tmp"
 CODEX_HOME = Path.home() / ".codex"
 AUTH_JSON = CODEX_HOME / "auth.json"
 CODEX_GENERATED_IMAGES = CODEX_HOME / "generated_images"
-SCRIPT_VERSION = "2026-05-13.1"
+SCRIPT_VERSION = "2026-11-05.1"
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 IMAGE_PROVIDER_LABEL = os.environ.get("CODEX_IMAGE_PROVIDER_LABEL", "openai-codex")
 IMAGE_BACKEND_LABEL = os.environ.get("CODEX_IMAGE_BACKEND_LABEL", "codex-cli-built-in-image-generation")
@@ -436,12 +438,154 @@ def resize_and_convert_image(
     return changed
 
 
+AUTHORIZED_IMAGE_MODELS = {"openai/gpt-image-2.6-flare", "openai/gpt-image-2.6-sunburst"}
+
+
+def run_openclaw(args) -> int:
+    """Managed CLI only; never inspect auth or run an agent drawing step.
+
+    OpenClaw 2026.10.4 resolveCapabilityModelCandidates returns [override]
+    before configured/automatic fallbacks. attempts contains failed candidates.
+    The reported model may be the candidate defaulted by OpenClaw, not a
+    provider-side model attestation.
+    """
+    # Reject aliases before any cleanup or failure metadata can alter a source.
+    try:
+        output = Path(args.filename).expanduser().resolve()
+        meta = None if args.no_meta else Path(args.meta_json or default_meta_path(output)).expanduser().resolve()
+        receipt = args.reference_receipt.expanduser().resolve() if args.reference_receipt else None
+        original = args.reference_image.expanduser().resolve() if args.reference_image else None
+        paths = [(name, path) for name, path in
+                 (("output", output), ("metadata", meta), ("receipt", receipt), ("reference", original))
+                 if path is not None]
+        for index, (name, path) in enumerate(paths):
+            for other_name, other in paths[index + 1:]:
+                if path == other or (path.exists() and other.exists() and path.samefile(other)):
+                    raise ValueError(f"{name} and {other_name} paths must not overlap")
+    except (OSError, ValueError, RuntimeError) as exc:
+        return fail(str(exc))
+    payload = {"status": "failed", "engine": {"script": "codex_cli_image_gen.py", "scriptVersion": SCRIPT_VERSION},
+               "generation": {"backend": "openclaw-infer", "requested": {"provider": "openai", "model": args.image_model,
+                 "quality": args.quality, "size": args.size, "timeoutMs": args.timeout_ms,
+                 "operation": "edit" if args.reference_image else "generate"}, "result": None,
+                 "modelEvidence": "OpenClaw CLI reported result; may default to request, not underlying model attestation",
+                 "fallbackProviderUsed": None},
+               "prompt": {"sha256": hashlib.sha256(args.prompt.encode()).hexdigest()}}
+    metadata_started = False
+    try:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.unlink(missing_ok=True)
+        if meta:
+            meta.unlink(missing_ok=True)
+        if receipt:
+            receipt.unlink(missing_ok=True)
+        if args.image_model not in AUTHORIZED_IMAGE_MODELS:
+            raise ValueError("explicit authorized GPT Image 2.6 provider/model required")
+        if args.postprocess_transparent != "off":
+            raise ValueError("openclaw-infer permits resize/format conversion only")
+        if args.timeout_ms <= 0:
+            raise ValueError("timeout-ms must be positive")
+        if args.reference_receipt and not args.reference_image:
+            raise ValueError("reference-receipt requires reference-image")
+        with tempfile.TemporaryDirectory(prefix="openclaw-image-") as temp:
+            raw = (Path(temp) / "raw.png").resolve()
+            reference = None
+            snapshot = None
+            if args.reference_image:
+                data = original.read_bytes()
+                from PIL import Image
+                with Image.open(io.BytesIO(data)) as image:
+                    image.verify()
+                snapshot = Path(temp) / ("reference" + original.suffix)
+                snapshot.write_bytes(data)
+                reference = {"referencePath": str(original), "referenceSha256": hashlib.sha256(data).hexdigest(),
+                             "referenceBytes": len(data), "submittedPath": str(snapshot)}
+            operation = "edit" if snapshot else "generate"
+            cmd = ["openclaw", "infer", "image", operation, "--agent", "main", "--model", args.image_model,
+                   "--prompt", args.prompt, "--output", str(raw), "--json", "--output-format", "png",
+                   "--quality", args.quality, "--size", args.size, "--timeout-ms", str(args.timeout_ms)]
+            if snapshot:
+                cmd.extend(["--file", str(snapshot)])
+            proc = subprocess.run(cmd, text=True, capture_output=True, timeout=args.timeout_ms / 1000 + 30)
+            if proc.returncode:
+                raise ValueError(f"OpenClaw image request failed (exit {proc.returncode})")
+            result = json.loads(proc.stdout)
+            payload["generation"]["result"] = {key: result.get(key) for key in
+                ("provider", "model", "attempts", "ignoredOverrides", "capability", "transport")}
+            expected_model = args.image_model.split("/", 1)[1]
+            if (result.get("ok") is not True or result.get("provider") != "openai"
+                or result.get("model") != expected_model or result.get("attempts") != []
+                or result.get("ignoredOverrides") != [] or result.get("transport") != "local"
+                or result.get("capability") != "image." + operation):
+                raise ValueError("OpenClaw result mismatch, fallback attempt, or ignored override")
+            outputs = result.get("outputs")
+            if not isinstance(outputs, list) or len(outputs) != 1 or Path(outputs[0].get("path", "")).resolve() != raw:
+                raise ValueError("OpenClaw output path/count mismatch")
+            if not raw.is_file() or raw.stat().st_size <= 0 or outputs[0].get("size") != raw.stat().st_size:
+                raise ValueError("OpenClaw output missing or size mismatch")
+            from PIL import Image
+            with Image.open(raw) as image:
+                image.verify()
+            payload["generation"]["fallbackProviderUsed"] = False
+            raw_sha = hashlib.sha256(raw.read_bytes()).hexdigest()
+            resize_and_convert_image(raw, args.max_width, args.max_size, args.jpeg_quality, args.flatten_to_jpeg)
+            shutil.copyfile(raw, output)
+            payload.update(status="success", output={"path": str(output), "bytes": output.stat().st_size,
+                           "sha256": hashlib.sha256(output.read_bytes()).hexdigest(), "rawSha256": raw_sha},
+                           postprocess={"maxWidth": args.max_width, "maxSize": args.max_size,
+                           "jpegQuality": args.jpeg_quality, "flattenToJpeg": args.flatten_to_jpeg})
+            if reference and receipt:
+                receipt.parent.mkdir(parents=True, exist_ok=True)
+                receipt.write_text(json.dumps({"schemaVersion": 3, "status": "delivered",
+                    "evidenceScope": "openclaw-cli-edit-request", "deliveryMethod": "openclaw-infer-image-edit",
+                    "cliOption": "--file", "cliReturncode": 0, **reference,
+                    "requestedModel": args.image_model, "provider": result["provider"], "model": result["model"],
+                    "attempts": [], "outputSha256": payload["output"]["sha256"],
+                    "semanticVisualApproval": {"status": "not-reviewed"}}, indent=2) + "\n")
+        if meta:
+            metadata_started = True
+            meta.parent.mkdir(parents=True, exist_ok=True)
+            meta.write_text(json.dumps(payload, indent=2) + "\n")
+    except Exception as exc:
+        payload["status"] = "failed"
+        payload["error"] = str(exc)
+        payload.pop("output", None)
+        payload.pop("postprocess", None)
+        for path in (output, receipt, meta):
+            if path:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError as cleanup_exc:
+                    print(f"Could not remove {path}: {cleanup_exc}", file=sys.stderr)
+        # Keep ordinary failure evidence, but never retry a failed metadata delivery.
+        if meta and not metadata_started:
+            try:
+                meta.parent.mkdir(parents=True, exist_ok=True)
+                meta.write_text(json.dumps(payload, indent=2) + "\n")
+            except OSError:
+                try:
+                    meta.unlink(missing_ok=True)
+                except OSError as cleanup_exc:
+                    print(f"Could not remove {meta}: {cleanup_exc}", file=sys.stderr)
+    if payload["status"] != "success":
+        return fail(payload["error"])
+    print(output)
+    return 0
+
+
 def main() -> int:
     if '--version' in sys.argv[1:] and len(sys.argv[1:]) == 1:
         print(SCRIPT_VERSION)
         return 0
 
     parser = argparse.ArgumentParser(description="Generate image via Codex CLI auth-only login")
+    parser.add_argument("--backend", choices=["codex", "openclaw-infer"], default="codex")
+    parser.add_argument("--image-model", default=None)
+    parser.add_argument("--quality", choices=["low", "medium", "high", "auto"], default="medium")
+    parser.add_argument("--size", default="1024x1024")
+    parser.add_argument("--timeout-ms", type=int, default=1800000)
+    parser.add_argument("--reference-image", type=Path)
+    parser.add_argument("--reference-receipt", type=Path)
     parser.add_argument("--prompt", "-p", required=True, help="Image prompt")
     parser.add_argument("--filename", "-f", required=True, help="Output filename/path")
     parser.add_argument("--meta-json", type=Path, default=None, help="Generation metadata JSON path; default is <filename>.meta.json")
@@ -483,6 +627,10 @@ def main() -> int:
         print(SCRIPT_VERSION)
         return 0
 
+    if args.backend == "openclaw-infer":
+        return run_openclaw(args)
+    if args.image_model or args.reference_image or args.reference_receipt:
+        return fail("image-model/reference options require openclaw-infer backend")
     ok, reason = ensure_auth()
     if not ok:
         return fail(f"Codex auth unavailable: {reason}")
