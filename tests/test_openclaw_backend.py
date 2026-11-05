@@ -1,6 +1,8 @@
 import argparse
+import errno
 import hashlib
 import importlib.util
+import io
 import json
 import subprocess
 import tempfile
@@ -16,14 +18,16 @@ spec.loader.exec_module(engine)
 
 
 class OpenClawTests(unittest.TestCase):
-    def invoke(self, mode='ok', reference=False):
+    def invoke(self, mode='ok', reference=False, metadata_error=None, partial=False, no_meta=False):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             output = root / 'output.jpg'
             output.write_bytes(b'stale')
             ref = root / 'ref.png'
             Image.new('RGB', (32, 32), 'blue').save(ref)
-            args = argparse.Namespace(filename=str(output), no_meta=False, meta_json=None,
+            original_reference = ref.read_bytes()
+            meta_path = engine.default_meta_path(output)
+            args = argparse.Namespace(filename=str(output), no_meta=no_meta, meta_json=None,
                 reference_receipt=root / 'receipt.json' if reference else None, reference_image=ref if reference else None,
                 image_model='openai/gpt-image-2.6-sunburst', quality='medium', size='1024x1024',
                 timeout_ms=9000, prompt='exact prompt', postprocess_transparent='off',
@@ -55,9 +59,39 @@ class OpenClawTests(unittest.TestCase):
                 if mode == 'stale': data['outputs'][0]['path'] = str(output)
                 return subprocess.CompletedProcess(cmd, 7 if mode == 'failed' else 0,
                     'bad json' if mode == 'json' else json.dumps(data), '')
-            with patch.object(engine.subprocess, 'run', side_effect=fake), patch.object(engine, 'ensure_auth', side_effect=AssertionError('must not read auth')):
+            write_text = Path.write_text
+            metadata_writes = []
+            def persist(path, text, *positional, **kwargs):
+                if path == meta_path:
+                    metadata_writes.append(json.loads(text))
+                    if metadata_error:
+                        if mode == 'ok':
+                            self.assertTrue(output.exists())
+                            self.assertEqual('delivered', json.loads(args.reference_receipt.read_text())['status'])
+                        if partial:
+                            write_text(path, text[:40])
+                        raise metadata_error
+                return write_text(path, text, *positional, **kwargs)
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with patch.object(engine.subprocess, 'run', side_effect=fake), patch.object(engine, 'ensure_auth', side_effect=AssertionError('must not read auth')), \
+                 patch.object(Path, 'write_text', new=persist), patch.object(engine.sys, 'stdout', stdout), patch.object(engine.sys, 'stderr', stderr):
                 code = engine.run_openclaw(args)
-            meta = json.loads(engine.default_meta_path(output).read_text())
+            self.assertEqual(original_reference, ref.read_bytes())
+            if metadata_error:
+                self.assertNotEqual(0, code)
+                self.assertEqual('', stdout.getvalue())
+                self.assertEqual(1, len(metadata_writes))
+                self.assertEqual('success' if mode == 'ok' else 'failed', metadata_writes[0]['status'])
+                self.assertFalse(output.exists())
+                self.assertFalse(args.reference_receipt.exists())
+                self.assertFalse(meta_path.exists())
+                self.assertIn(str(metadata_error) if mode == 'ok' else 'OpenClaw image request failed (exit 7)', stderr.getvalue())
+                return
+            if no_meta:
+                self.assertFalse(meta_path.exists())
+                self.assertEqual([], metadata_writes)
+            else:
+                meta = json.loads(meta_path.read_text())
             if mode != 'ok':
                 self.assertNotEqual(0, code)
                 self.assertFalse(output.exists())
@@ -65,9 +99,10 @@ class OpenClawTests(unittest.TestCase):
                 self.assertEqual('failed', meta['status'])
                 return
             self.assertEqual(0, code)
-            self.assertEqual('success', meta['status'])
-            self.assertEqual(args.image_model, meta['generation']['requested']['model'])
-            self.assertEqual('gpt-image-2.6-sunburst', meta['generation']['result']['model'])
+            if not no_meta:
+                self.assertEqual('success', meta['status'])
+                self.assertEqual(args.image_model, meta['generation']['requested']['model'])
+                self.assertEqual('gpt-image-2.6-sunburst', meta['generation']['result']['model'])
             with Image.open(output) as image:
                 self.assertEqual(('JPEG', (40, 30)), (image.format, image.size))
             if reference:
@@ -79,6 +114,22 @@ class OpenClawTests(unittest.TestCase):
     def test_generate_and_reference_edit(self):
         self.invoke()
         self.invoke(reference=True)
+
+    def test_metadata_delivery_failure_cleans_reference_edit(self):
+        for error, partial in [(PermissionError(errno.EACCES, 'metadata denied'), False),
+                               (OSError(errno.ENOSPC, 'metadata disk full'), False),
+                               (OSError(errno.ENOSPC, 'metadata disk full'), True)]:
+            with self.subTest(error=error, partial=partial):
+                self.invoke(reference=True, metadata_error=error, partial=partial)
+
+    def test_failure_metadata_error_preserves_original_cause(self):
+        for error in (PermissionError(errno.EACCES, 'metadata denied'),
+                      OSError(errno.ENOSPC, 'metadata disk full')):
+            with self.subTest(error=error):
+                self.invoke('failed', reference=True, metadata_error=error, partial=True)
+
+    def test_reference_edit_without_metadata(self):
+        self.invoke(reference=True, no_meta=True)
 
     def test_fail_closed(self):
         for mode in ['model', 'provider', 'fallback', 'ignored', 'stale', 'failed', 'missing', 'json', 'invalid-model']:

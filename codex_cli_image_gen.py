@@ -477,6 +477,7 @@ def run_openclaw(args) -> int:
                  "modelEvidence": "OpenClaw CLI reported result; may default to request, not underlying model attestation",
                  "fallbackProviderUsed": None},
                "prompt": {"sha256": hashlib.sha256(args.prompt.encode()).hexdigest()}}
+    metadata_started = False
     try:
         if args.image_model not in AUTHORIZED_IMAGE_MODELS:
             raise ValueError("explicit authorized GPT Image 2.6 provider/model required")
@@ -541,15 +542,31 @@ def run_openclaw(args) -> int:
                     "requestedModel": args.image_model, "provider": result["provider"], "model": result["model"],
                     "attempts": [], "outputSha256": payload["output"]["sha256"],
                     "semanticVisualApproval": {"status": "not-reviewed"}}, indent=2) + "\n")
+        if meta:
+            metadata_started = True
+            meta.parent.mkdir(parents=True, exist_ok=True)
+            meta.write_text(json.dumps(payload, indent=2) + "\n")
     except Exception as exc:
         payload["status"] = "failed"
-        output.unlink(missing_ok=True)
-        if receipt:
-            receipt.unlink(missing_ok=True)
         payload["error"] = str(exc)
-    if meta:
-        meta.parent.mkdir(parents=True, exist_ok=True)
-        meta.write_text(json.dumps(payload, indent=2) + "\n")
+        payload.pop("output", None)
+        payload.pop("postprocess", None)
+        for path in (output, receipt, meta):
+            if path:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError as cleanup_exc:
+                    print(f"Could not remove {path}: {cleanup_exc}", file=sys.stderr)
+        # Keep ordinary failure evidence, but never retry a failed metadata delivery.
+        if meta and not metadata_started:
+            try:
+                meta.parent.mkdir(parents=True, exist_ok=True)
+                meta.write_text(json.dumps(payload, indent=2) + "\n")
+            except OSError:
+                try:
+                    meta.unlink(missing_ok=True)
+                except OSError as cleanup_exc:
+                    print(f"Could not remove {meta}: {cleanup_exc}", file=sys.stderr)
     if payload["status"] != "success":
         return fail(payload["error"])
     print(output)
