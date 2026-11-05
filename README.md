@@ -61,3 +61,47 @@ python3 codex_cli_image_gen.py \
 - Intended as a reusable engine; prompt/style profiles should live separately under `profiles/`
 - Engine default should stay neutral; pipeline-specific optimization (for example Daum blog JPEG slimming) should be expressed via profile/flags, not hardcoded as the global default.
 - In short: **기본은 포맷 보존**, **블로그/업로드용 경량화는 profile/옵션으로**.
+
+### Explicit image model backend (OpenClaw 2026.10.4)
+
+The default remains the legacy Codex backend. `codex -m` and
+`CODEX_IMAGE_MODEL_LABEL` do not select an image model. For actual selection:
+
+```sh
+python3 codex_cli_image_gen.py --backend openclaw-infer \
+  --image-model openai/gpt-image-2.6-flare --quality medium \
+  --prompt 'A single editorial scene without text' --filename /tmp/body.jpg \
+  --size 1536x1024 --max-size 1280 --jpeg-quality 90 --flatten-to-jpeg
+```
+
+Only `openai/gpt-image-2.6-flare` and `openai/gpt-image-2.6-sunburst` are
+accepted. `--reference-image PATH --reference-receipt PATH` switches to
+`openclaw infer image edit --file SNAPSHOT`; the snapshot contains the exact
+approved bytes. Credentials remain with OpenClaw (`--agent main`); this backend
+never reads Codex auth. Conversion is limited to resizing and format conversion.
+
+The installed CLI's `image-CNpAuh-9.mjs` forwards `modelOverride` into
+`runtime-B5Vk7EEi.mjs`. In `runtime-shared-0B7S8h9l.mjs`,
+`resolveCapabilityModelCandidates` returns `[override]` before configured and
+automatic fallback candidates. `image-generation-provider-Dnv6lkDG.mjs` forwards
+the requested image model into `tools[].model` on the managed OAuth Responses
+transport (or the direct Image API request). The Responses *text* model can
+retry internally on model-unavailable errors; that does not change the pinned
+image tool model. No config mutation is needed.
+
+JSON is a top-level envelope: `ok`, `capability`, `transport`, `provider`,
+`model`, `attempts` (failed candidates), `outputs` (`path`, `size`, `mimeType`),
+and `ignoredOverrides`. The wrapper rejects unexpected values, any failed
+candidate, ignored overrides, missing bytes, or a path outside its fresh exact
+output target. Failed requests remove stale final output and receipt and write
+failure metadata. Unknown backends are rejected by argparse.
+
+Metadata separates `generation.requested` from `generation.result`. OpenClaw
+can default the reported model to the requested candidate; this is observed CLI
+result evidence, **not underlying model attestation**. Schema 3 reference receipts
+record original path/SHA/byte count, submitted snapshot path, requested model,
+CLI-reported provider/model, output hash, and unreviewed semantic status.
+Snapshots are temporary and are removed after the request. No inner-tool
+self-attestation or historical Codex receipt relabelling is performed.
+
+Offline checks: `python3 -m unittest discover -s tests -q`.
