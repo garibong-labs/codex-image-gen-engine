@@ -464,12 +464,6 @@ def run_openclaw(args) -> int:
                     raise ValueError(f"{name} and {other_name} paths must not overlap")
     except (OSError, ValueError, RuntimeError) as exc:
         return fail(str(exc))
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.unlink(missing_ok=True)
-    if meta:
-        meta.unlink(missing_ok=True)
-    if receipt:
-        receipt.unlink(missing_ok=True)
     payload = {"status": "failed", "engine": {"script": "codex_cli_image_gen.py", "scriptVersion": SCRIPT_VERSION},
                "generation": {"backend": "openclaw-infer", "requested": {"provider": "openai", "model": args.image_model,
                  "quality": args.quality, "size": args.size, "timeoutMs": args.timeout_ms,
@@ -479,6 +473,12 @@ def run_openclaw(args) -> int:
                "prompt": {"sha256": hashlib.sha256(args.prompt.encode()).hexdigest()}}
     metadata_started = False
     try:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.unlink(missing_ok=True)
+        if meta:
+            meta.unlink(missing_ok=True)
+        if receipt:
+            receipt.unlink(missing_ok=True)
         if args.image_model not in AUTHORIZED_IMAGE_MODELS:
             raise ValueError("explicit authorized GPT Image 2.6 provider/model required")
         if args.postprocess_transparent != "off":

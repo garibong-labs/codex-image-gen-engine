@@ -20,7 +20,7 @@ spec.loader.exec_module(engine)
 class OpenClawTests(unittest.TestCase):
     def invoke(self, mode='ok', reference=False, metadata_error=None, partial=False, no_meta=False):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             output = root / 'output.jpg'
             output.write_bytes(b'stale')
             ref = root / 'ref.png'
@@ -140,7 +140,7 @@ class OpenClawTests(unittest.TestCase):
         for destination in ('filename', 'meta_json', 'reference_receipt'):
             for alias in ('same', 'symlink', 'hardlink'):
                 with self.subTest(destination=destination, alias=alias), tempfile.TemporaryDirectory() as directory:
-                    root = Path(directory)
+                    root = Path(directory).resolve()
                     reference = root / 'reference.png'
                     Image.new('RGB', (32, 32), 'blue').save(reference)
                     original = reference.read_bytes()
@@ -169,7 +169,7 @@ class OpenClawTests(unittest.TestCase):
         for first, second in (('filename', 'meta_json'), ('filename', 'reference_receipt'),
                               ('meta_json', 'reference_receipt')):
             with self.subTest(first=first, second=second), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
+                root = Path(directory).resolve()
                 paths = dict(filename=root / 'output.png', meta_json=root / 'meta.json',
                              reference_receipt=root / 'receipt.json')
                 for path in paths.values():
@@ -184,7 +184,7 @@ class OpenClawTests(unittest.TestCase):
 
     def test_symlink_temporary_root_succeeds(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             real = root / 'real'
             real.mkdir()
             alias = root / 'alias'
@@ -192,6 +192,76 @@ class OpenClawTests(unittest.TestCase):
             with patch.object(tempfile, 'tempdir', str(alias)):
                 self.invoke()
                 self.invoke(reference=True)
+
+    def test_metadata_failures_with_symlink_temporary_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            real = root / 'real'
+            real.mkdir()
+            alias = root / 'alias'
+            alias.symlink_to(real, target_is_directory=True)
+            with patch.object(tempfile, 'tempdir', str(alias)):
+                self.test_metadata_delivery_failure_cleans_reference_edit()
+                self.test_failure_metadata_error_preserves_original_cause()
+
+    def test_initial_cleanup_failure_cleans_remaining_artifacts(self):
+        for operation in ('mkdir', 'output', 'metadata', 'receipt'):
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                output, meta, receipt, reference = (root / name for name in
+                    ('output.png', 'meta.json', 'receipt.json', 'reference.png'))
+                output.write_bytes(b'stale output')
+                meta.write_text(json.dumps({'status': 'success'}))
+                receipt.write_text(json.dumps({'status': 'delivered'}))
+                reference.write_bytes(b'preserve reference')
+                args = argparse.Namespace(filename=str(output), no_meta=False, meta_json=str(meta),
+                    reference_receipt=receipt, reference_image=reference,
+                    image_model='openai/gpt-image-2.6-sunburst', prompt='prompt',
+                    quality='medium', size='1024x1024', timeout_ms=9000)
+                denied = {'output': output, 'metadata': meta, 'receipt': receipt}.get(operation)
+                failure = PermissionError(errno.EACCES, 'initial ' + operation + ' denied')
+                unlink, mkdir, write_text = Path.unlink, Path.mkdir, Path.write_text
+                attempted = []
+
+                def remove(path, *positional, **kwargs):
+                    attempted.append(path)
+                    if path == denied:
+                        raise failure
+                    return unlink(path, *positional, **kwargs)
+
+                def make_directory(path, *positional, **kwargs):
+                    if operation == 'mkdir' and path == output.parent:
+                        raise failure
+                    return mkdir(path, *positional, **kwargs)
+
+                def persist(path, text, *positional, **kwargs):
+                    if operation == 'metadata' and path == meta:
+                        raise PermissionError(errno.EACCES, 'failure metadata denied')
+                    return write_text(path, text, *positional, **kwargs)
+
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with patch.object(Path, 'unlink', new=remove), patch.object(Path, 'mkdir', new=make_directory), \
+                     patch.object(Path, 'write_text', new=persist), patch.object(engine.subprocess, 'run') as run, \
+                     patch.object(engine.sys, 'stdout', stdout), patch.object(engine.sys, 'stderr', stderr):
+                    self.assertEqual(1, engine.run_openclaw(args))
+                run.assert_not_called()
+                self.assertEqual('', stdout.getvalue())
+                self.assertIn(str(failure), stderr.getvalue())
+                self.assertEqual(b'preserve reference', reference.read_bytes())
+                for path in (output, meta, receipt):
+                    self.assertIn(path, attempted)
+                    if path == denied:
+                        self.assertIn('Could not remove ' + str(path), stderr.getvalue())
+                    elif path != meta:
+                        self.assertFalse(path.exists())
+                if operation in ('output', 'receipt'):
+                    evidence = json.loads(meta.read_text())
+                    self.assertEqual('failed', evidence['status'])
+                    self.assertEqual(str(failure), evidence['error'])
+                elif operation == 'metadata':
+                    self.assertEqual('success', json.loads(meta.read_text())['status'])
+                else:
+                    self.assertFalse(meta.exists())
 
     def test_unknown_backend_and_legacy_default(self):
         script = str(Path(engine.__file__))
