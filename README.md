@@ -105,3 +105,7 @@ Snapshots are temporary and are removed after the request. No inner-tool
 self-attestation or historical Codex receipt relabelling is performed.
 
 Offline checks: `python3 -m unittest discover -s tests -q`.
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
